@@ -1,0 +1,211 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: proxmox-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-proxmox_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-proxmox_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - proxmox-ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-proxmox_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: proxmox-ai-n8n
+    restart: unless-stopped
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE:-true}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD:-changeme}
+      - N8N_HOST=${N8N_HOST:-0.0.0.0}
+      - N8N_PORT=${N8N_PORT:-5678}
+      - N8N_PROTOCOL=${N8N_PROTOCOL:-http}
+      - WEBHOOK_URL=${WEBHOOK_URL:-http://localhost:5678}
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE:-America/New_York}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB:-proxmox_ai}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER:-proxmox_user}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+    networks:
+      - proxmox-ai-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  proxmox-monitor:
+    build:
+      context: ./services/proxmox-monitor
+      dockerfile: Dockerfile
+    container_name: proxmox-ai-monitor
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-proxmox_user}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-proxmox_ai}
+      - PROXMOX_NODES_CONFIG=/app/config/proxmox-nodes.yml
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - API_HOST=${MONITOR_API_HOST:-0.0.0.0}
+      - API_PORT=${MONITOR_API_PORT:-8000}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config/proxmox-nodes.yml:/app/config/proxmox-nodes.yml:ro
+    networks:
+      - proxmox-ai-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: proxmox-ai-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - proxmox-ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  llm-engine:
+    build:
+      context: ./services/llm-engine
+      dockerfile: Dockerfile
+    container_name: proxmox-ai-llm-engine
+    restart: unless-stopped
+    environment:
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "8001:8001"
+    networks:
+      - proxmox-ai-network
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  sesame-tts:
+    build:
+      context: ./services/sesame-tts
+      dockerfile: Dockerfile
+    container_name: proxmox-ai-sesame-tts
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "8002:8002"
+    volumes:
+      - sesame_models:/app/models
+    networks:
+      - proxmox-ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  twilio-bridge:
+    build:
+      context: ./services/twilio-bridge
+      dockerfile: Dockerfile
+    container_name: proxmox-ai-twilio-bridge
+    restart: unless-stopped
+    environment:
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER}
+      - ALERT_PHONE_NUMBER=${ALERT_PHONE_NUMBER}
+      - SESAME_TTS_URL=${SESAME_TTS_URL:-http://sesame-tts:8002}
+      - LLM_ENGINE_URL=${LLM_ENGINE_URL:-http://llm-engine:8001}
+      - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://n8n:5678}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-proxmox_user}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-proxmox_ai}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "8003:8003"
+    networks:
+      - proxmox-ai-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sesame-tts:
+        condition: service_healthy
+      llm-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8003/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  learning-engine:
+    build:
+      context: ./services/learning-engine
+      dockerfile: Dockerfile
+    container_name: proxmox-ai-learning-engine
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-proxmox_user}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-proxmox_ai}
+      - CHROMA_PERSIST_DIR=/app/data/chroma
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "8004:8004"
+    volumes:
+      - learning_data:/app/data
+    networks:
+      - proxmox-ai-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8004/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  proxmox-ai-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  n8n_data:
+  ollama_data:
+  sesame_models:
+  learning_data:
